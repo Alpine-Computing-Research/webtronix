@@ -1,9 +1,15 @@
 //! Fetch a list of URLs concurrently, extract the text of each HTML page or
 //! PDF document and store the result in a SQLite index on disk.
 //!
+//! HTML goes through [trafilatura], which keeps the main body of a page and
+//! drops navigation, adverts, footers and other boilerplate. `--raw-html`
+//! turns this off and stores the HTML exactly as fetched instead.
+//!
 //! The index is a single `pages` table keyed by URL holding the MIME type,
 //! the title, the extracted text and the HTTP validators used for conditional
 //! requests.
+//!
+//! [trafilatura]: https://crates.io/crates/trafilatura
 //!
 //! Bandwidth is kept down by deduplicating the input, accepting compressed
 //! responses, refusing unsupported bodies before they are read, and sending
@@ -30,6 +36,7 @@ use scraper::{Html, Selector};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use trafilatura::Options;
 
 /// Extract the text of a list of web pages and PDFs into a SQLite index.
 #[derive(Parser)]
@@ -53,6 +60,10 @@ struct Args {
     /// Suppress the progress bar and all logging.
     #[arg(short, long, conflicts_with = "verbose")]
     quiet: bool,
+    /// Store each HTML page exactly as fetched instead of its extracted text.
+    /// PDFs are still converted to text.
+    #[arg(long)]
+    raw_html: bool,
 }
 
 /// Routes log lines through the progress bar so they do not tear it. When
@@ -176,12 +187,13 @@ async fn main() -> Result<()> {
         .brotli(true)
         .build()?;
 
+    let raw_html = args.raw_html;
     let mut results = stream::iter(urls.iter().cloned())
         .map(|url| {
             let client = &client;
             let cached = previous.get(&url);
             async move {
-                match fetch(client, &url, cached).await {
+                match fetch(client, &url, cached, raw_html).await {
                     Ok(page) => page,
                     Err(e) if cached.is_some() => {
                         warn!(url, "keeping previous entry: {e:#}");
@@ -227,11 +239,13 @@ async fn main() -> Result<()> {
 }
 
 /// Fetch and extract one page, sending a conditional request when validators
-/// are available. Returns `None` on `304 Not Modified`.
+/// are available. Returns `None` on `304 Not Modified`. With `raw_html` the
+/// text of an HTML page is the page itself.
 async fn fetch(
     client: &Client,
     url: &str,
     cached: Option<&Validators>,
+    raw_html: bool,
 ) -> Result<Option<Page>> {
     let mut req = client
         .get(url)
@@ -281,11 +295,14 @@ async fn fetch(
     };
     let kind = kind.unwrap_or_else(|| Kind::sniff(&body));
     let mime = declared.unwrap_or_else(|| kind.mime().to_owned());
+    let owned_url = url.to_owned();
     let (title, text) = tokio::task::spawn_blocking(move || {
-        panic::catch_unwind(AssertUnwindSafe(|| extract(kind, &body)))
-            .unwrap_or_else(|payload| {
-                Err(eyre!("extractor panicked: {}", panic_message(&*payload)))
-            })
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            extract(kind, &body, &owned_url, raw_html)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(eyre!("extractor panicked: {}", panic_message(&*payload)))
+        })
     })
     .await??;
     info!(url, mime, bytes = text.len(), "indexed");
@@ -309,10 +326,21 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
-/// Pull the title and text out of a body of the given kind.
-fn extract(kind: Kind, body: &[u8]) -> Result<(Option<String>, String)> {
+/// Pull the title and text out of a body of the given kind. `url` is the
+/// page's address, used to resolve links and metadata while extracting HTML.
+/// With `raw_html` an HTML body is stored as is rather than extracted.
+fn extract(
+    kind: Kind,
+    body: &[u8],
+    url: &str,
+    raw_html: bool,
+) -> Result<(Option<String>, String)> {
     match kind {
-        Kind::Html => Ok(extract_html(&String::from_utf8_lossy(body))),
+        Kind::Html if raw_html => {
+            let html = String::from_utf8_lossy(body);
+            Ok((html_title(&html), html.into_owned()))
+        }
+        Kind::Html => Ok(extract_html(&String::from_utf8_lossy(body), url)),
         Kind::Pdf => extract_pdf(body),
     }
 }
@@ -346,19 +374,47 @@ fn extract_pdf(bytes: &[u8]) -> Result<(Option<String>, String)> {
     Ok((title, text))
 }
 
-/// Pull the title and the visible text out of an HTML document, skipping
-/// script, style and other non-content elements.
-fn extract_html(html: &str) -> (Option<String>, String) {
+/// Pull the title and the main text out of an HTML document with
+/// trafilatura, which drops navigation, adverts, footers and the like.
+///
+/// Pages trafilatura gives up on (for example ones with no paragraph of
+/// prose at all) fall back to [`visible_text`] so they are still indexed.
+fn extract_html(html: &str, url: &str) -> (Option<String>, String) {
+    let mut opts = Options::default().with_fallback(true);
+    opts.original_url = url.parse().ok();
+    opts.exclude_comments = true;
+    match trafilatura::extract(html, &opts) {
+        Ok(result) => {
+            // The `<title>` element is preferred; trafilatura's metadata
+            // title (OpenGraph, JSON-LD) only fills in when it is missing.
+            let title = html_title(html).or_else(|| {
+                Some(result.metadata.title.trim().to_owned())
+                    .filter(|t| !t.is_empty())
+            });
+            (title, result.content_text.trim().to_owned())
+        }
+        Err(e) => {
+            warn!(url, "no main content found, indexing visible text: {e}");
+            (html_title(html), visible_text(html))
+        }
+    }
+}
+
+/// The contents of the `<title>` element, if there is a non-empty one.
+fn html_title(html: &str) -> Option<String> {
     let doc = Html::parse_document(html);
-    let title_selector = Selector::parse("title").expect("valid selector");
-    let title = doc
-        .select(&title_selector)
+    let selector = Selector::parse("title").expect("valid selector");
+    doc.select(&selector)
         .next()
         .map(|t| t.text().collect::<String>().trim().to_owned())
-        .filter(|t| !t.is_empty());
+        .filter(|t| !t.is_empty())
+}
 
-    let text = doc
-        .tree
+/// All visible text of an HTML document joined by single spaces, skipping
+/// script, style and other non-content elements.
+fn visible_text(html: &str) -> String {
+    let doc = Html::parse_document(html);
+    doc.tree
         .nodes()
         .filter_map(|node| {
             let text = node.value().as_text()?;
@@ -373,9 +429,7 @@ fn extract_html(html: &str) -> (Option<String>, String) {
         })
         .flat_map(|(text, _)| text.split_whitespace())
         .collect::<Vec<_>>()
-        .join(" ");
-
-    (title, text)
+        .join(" ")
 }
 
 /// Read, trim and deduplicate the URL list.
@@ -473,13 +527,52 @@ fn prune(db: &Connection, urls: &[String]) -> Result<usize> {
 mod tests {
     use super::*;
 
+    const URL: &str = "https://example.com/post";
+
     #[test]
-    fn extract_skips_non_content() {
+    fn visible_text_skips_non_content() {
         let html = r#"<html><head><title> Hi </title><style>p{}</style></head>
             <body><p>Hello,   <b>world</b></p><script>var x = 1;</script></body></html>"#;
-        let (title, text) = extract_html(html);
-        assert_eq!(title.as_deref(), Some("Hi"));
-        assert_eq!(text, "Hello, world");
+        assert_eq!(html_title(html).as_deref(), Some("Hi"));
+        assert_eq!(visible_text(html), "Hello, world");
+    }
+
+    #[test]
+    fn extract_html_drops_boilerplate() {
+        let body = "This is the main article content. ".repeat(10);
+        let html = format!(
+            "<html><head><title>Site - Post</title></head><body>\
+             <nav><a href=\"/\">Home</a> <a href=\"/about\">About</a></nav>\
+             <article><h1>Post</h1><p>{body}</p></article>\
+             <footer>Copyright 2024 Site</footer></body></html>"
+        );
+        let (title, text) = extract_html(&html, URL);
+        assert_eq!(title.as_deref(), Some("Site - Post"));
+        assert!(text.contains("main article content"));
+        assert!(!text.contains("Home"), "nav kept: {text}");
+        assert!(!text.contains("Copyright"), "footer kept: {text}");
+    }
+
+    #[test]
+    fn extract_html_falls_back_on_pages_without_prose() {
+        let html = "<html><head><title>T</title></head><body>\
+                    <ul><li>one</li><li>two</li></ul></body></html>";
+        let (title, text) = extract_html(html, URL);
+        assert_eq!(title.as_deref(), Some("T"));
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+    }
+
+    #[test]
+    fn extract_keeps_html_verbatim_when_raw() {
+        let html = "<html><head><title>T</title></head>\
+                    <body><nav>Menu</nav><p>Hi</p></body></html>";
+        let (title, text) =
+            extract(Kind::Html, html.as_bytes(), URL, true).unwrap();
+        assert_eq!(title.as_deref(), Some("T"));
+        assert_eq!(text, html);
+        let (_, text) =
+            extract(Kind::Html, html.as_bytes(), URL, false).unwrap();
+        assert_ne!(text, html);
     }
 
     /// Build a one-page PDF with a correct cross-reference table.
@@ -522,7 +615,11 @@ mod tests {
     fn extract_reads_pdf_title_and_text() {
         let pdf = tiny_pdf("A Paper", "Hello PDF");
         assert_eq!(Kind::sniff(&pdf), Kind::Pdf);
-        let (title, text) = extract(Kind::Pdf, &pdf).unwrap();
+        let (title, text) = extract(Kind::Pdf, &pdf, URL, false).unwrap();
+        assert_eq!(title.as_deref(), Some("A Paper"));
+        assert_eq!(text, "Hello PDF");
+        // `--raw-html` leaves PDFs alone.
+        let (title, text) = extract(Kind::Pdf, &pdf, URL, true).unwrap();
         assert_eq!(title.as_deref(), Some("A Paper"));
         assert_eq!(text, "Hello PDF");
     }
