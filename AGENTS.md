@@ -53,9 +53,10 @@ Run the tool with:
 ```sh
 cargo run -- urls.txt                 # writes ./index.db
 cargo run -- urls.txt -o out.db -c 32 -t 60 -v
-cargo run -- urls.txt --raw-html      # store HTML verbatim, PDFs still extracted
-cargo run -- urls.txt --render never  # index HTML as served, no browser
-cargo run -- urls.txt --render always # render every HTML page in Chrome
+cargo run -- urls.txt --format html   # store HTML verbatim, PDFs still extracted
+cargo run -- urls.txt --render never  # no browser: HTML as served
+cargo run -- urls.txt --render always # run every HTML page's JavaScript in Chrome
+cargo run -- urls.txt --format html --render always  # rendered DOM, no extraction
 ```
 
 `RUST_LOG` overrides the log level chosen by `-v` / `-q`. Rendering needs a
@@ -140,8 +141,10 @@ a temp directory named after the process id, and a hand-built one-page PDF
 
 ## Things to be careful about
 
-- `--raw-html` affects only HTML; PDFs are always converted to text. Keep
+- `--format` affects only HTML; PDFs are always converted to text. Keep
   that invariant and its test.
+- `--format` and `--render` are independent axes (extract or not, run
+  JavaScript or not) and every combination is valid. Do not couple them.
 - Unsupported `Content-Type`s are rejected *before* the body is read. Do not
   move that check later; it is a bandwidth guard.
 - Missing or `application/octet-stream` content types are sniffed from the

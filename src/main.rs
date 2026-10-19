@@ -2,8 +2,9 @@
 //! PDF document and store the result in a SQLite index on disk.
 //!
 //! HTML goes through [trafilatura], which keeps the main body of a page and
-//! drops navigation, adverts, footers and other boilerplate. `--raw-html`
-//! turns this off and stores the HTML exactly as fetched instead.
+//! drops navigation, adverts, footers and other boilerplate. `--format html`
+//! turns this off and stores the HTML itself. PDFs are converted to text
+//! either way.
 //!
 //! The index is a single `pages` table keyed by URL holding the MIME type,
 //! the title, the extracted text and the HTTP validators used for conditional
@@ -16,6 +17,11 @@
 //! fills it in) are loaded in a headless Chrome so the text can be read from
 //! the rendered DOM instead. `--render` controls when that happens; by
 //! default only pages that look like such a shell are rendered.
+//!
+//! The two flags are independent, so each combination of extracting or not
+//! and running JavaScript or not is available: `--format text --render
+//! always` is text from the rendered DOM, `--format html --render never` is
+//! the HTML exactly as served, and so on.
 //!
 //! Bandwidth is kept down by deduplicating the input, accepting compressed
 //! responses, refusing unsupported bodies before they are read, and sending
@@ -61,10 +67,15 @@ struct Args {
     /// Per-request timeout in seconds. Also bounds each browser render.
     #[arg(short, long, default_value_t = 30)]
     timeout: u64,
+    /// What to store for each HTML page: its extracted text, or the HTML
+    /// itself (as served, or as rendered when `--render` applies). PDFs are
+    /// converted to text either way.
+    #[arg(short, long, value_enum, default_value_t = Format::Text)]
+    format: Format,
     /// When to load an HTML page in a headless browser so its JavaScript
-    /// runs before the text is extracted. `auto` renders only pages whose
-    /// served HTML looks like a script shell. Needs Chrome or Chromium; set
-    /// `CHROME` to the binary if it is not found on its own.
+    /// runs before the page is stored or its text extracted. `auto` renders
+    /// only pages whose served HTML looks like a script shell. Needs Chrome
+    /// or Chromium; set `CHROME` to the binary if it is not found on its own.
     #[arg(long, value_enum, default_value_t = Render::Auto)]
     render: Render,
     /// Log each request. `RUST_LOG` overrides the level.
@@ -73,11 +84,6 @@ struct Args {
     /// Suppress the progress bar and all logging.
     #[arg(short, long, conflicts_with = "verbose")]
     quiet: bool,
-    /// Store each HTML page exactly as fetched (or as rendered, see
-    /// `--render`) instead of its extracted text. PDFs are still converted
-    /// to text.
-    #[arg(long)]
-    raw_html: bool,
 }
 
 /// Routes log lines through the progress bar so they do not tear it. When
@@ -151,7 +157,18 @@ impl Kind {
     }
 }
 
-/// When HTML pages are rendered in a browser before their text is extracted.
+/// What is stored as the text of an HTML page. PDFs are unaffected.
+/// Independent of [`Render`], which decides whether JavaScript runs first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// Its extracted text.
+    Text,
+    /// The HTML itself, verbatim.
+    Html,
+}
+
+/// When HTML pages are rendered in a browser before they are stored or their
+/// text is extracted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Render {
     /// Only pages whose served HTML looks like a script shell.
@@ -402,7 +419,7 @@ async fn main() -> Result<()> {
         .brotli(true)
         .build()?;
 
-    let raw_html = args.raw_html;
+    let format = args.format;
     let renderer =
         Renderer::new(args.render, Duration::from_secs(args.timeout));
     let mut results = stream::iter(urls.iter().cloned())
@@ -411,7 +428,7 @@ async fn main() -> Result<()> {
             let renderer = &renderer;
             let cached = previous.get(&url);
             async move {
-                match fetch(client, renderer, &url, cached, raw_html).await {
+                match fetch(client, renderer, &url, cached, format).await {
                     Ok(page) => page,
                     Err(e) if cached.is_some() => {
                         warn!(url, "keeping previous entry: {e:#}");
@@ -460,8 +477,8 @@ async fn main() -> Result<()> {
 }
 
 /// Fetch and extract one page, sending a conditional request when validators
-/// are available. Returns `None` on `304 Not Modified`. With `raw_html` the
-/// text of an HTML page is the page itself.
+/// are available. Returns `None` on `304 Not Modified`. With
+/// [`Format::Html`] the text of an HTML page is the page itself.
 ///
 /// The conditional request and the validators always concern the served
 /// HTML; a page the renderer rebuilds in a browser still counts as unchanged
@@ -471,7 +488,7 @@ async fn fetch(
     renderer: &Renderer,
     url: &str,
     cached: Option<&Validators>,
-    raw_html: bool,
+    format: Format,
 ) -> Result<Option<Page>> {
     let mut req = client
         .get(url)
@@ -528,7 +545,7 @@ async fn fetch(
     let owned_url = url.to_owned();
     let (title, text) = tokio::task::spawn_blocking(move || {
         panic::catch_unwind(AssertUnwindSafe(|| {
-            extract(kind, &body, &owned_url, raw_html)
+            extract(kind, &body, &owned_url, format)
         }))
         .unwrap_or_else(|payload| {
             Err(eyre!("extractor panicked: {}", panic_message(&*payload)))
@@ -591,15 +608,15 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 
 /// Pull the title and text out of a body of the given kind. `url` is the
 /// page's address, used to resolve links and metadata while extracting HTML.
-/// With `raw_html` an HTML body is stored as is rather than extracted.
+/// With [`Format::Html`] an HTML body is stored as is rather than extracted.
 fn extract(
     kind: Kind,
     body: &[u8],
     url: &str,
-    raw_html: bool,
+    format: Format,
 ) -> Result<(Option<String>, String)> {
     match kind {
-        Kind::Html if raw_html => {
+        Kind::Html if format == Format::Html => {
             let html = String::from_utf8_lossy(body);
             Ok((html_title(&html), html.into_owned()))
         }
@@ -895,15 +912,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_keeps_html_verbatim_when_raw() {
+    fn extract_keeps_html_verbatim_in_html_format() {
         let html = "<html><head><title>T</title></head>\
                     <body><nav>Menu</nav><p>Hi</p></body></html>";
         let (title, text) =
-            extract(Kind::Html, html.as_bytes(), URL, true).unwrap();
+            extract(Kind::Html, html.as_bytes(), URL, Format::Html).unwrap();
         assert_eq!(title.as_deref(), Some("T"));
         assert_eq!(text, html);
         let (_, text) =
-            extract(Kind::Html, html.as_bytes(), URL, false).unwrap();
+            extract(Kind::Html, html.as_bytes(), URL, Format::Text).unwrap();
         assert_ne!(text, html);
     }
 
@@ -947,13 +964,12 @@ mod tests {
     fn extract_reads_pdf_title_and_text() {
         let pdf = tiny_pdf("A Paper", "Hello PDF");
         assert_eq!(Kind::sniff(&pdf), Kind::Pdf);
-        let (title, text) = extract(Kind::Pdf, &pdf, URL, false).unwrap();
-        assert_eq!(title.as_deref(), Some("A Paper"));
-        assert_eq!(text, "Hello PDF");
-        // `--raw-html` leaves PDFs alone.
-        let (title, text) = extract(Kind::Pdf, &pdf, URL, true).unwrap();
-        assert_eq!(title.as_deref(), Some("A Paper"));
-        assert_eq!(text, "Hello PDF");
+        // PDFs are converted to text whatever `--format` says.
+        for format in [Format::Text, Format::Html] {
+            let (title, text) = extract(Kind::Pdf, &pdf, URL, format).unwrap();
+            assert_eq!(title.as_deref(), Some("A Paper"));
+            assert_eq!(text, "Hello PDF");
+        }
     }
 
     #[test]
