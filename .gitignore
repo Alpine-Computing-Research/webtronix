@@ -22,4 +22,6 @@ msg.tmp
 trivia/*
 .idea
 *.db
+*.db-shm
+*.db-wal
 
