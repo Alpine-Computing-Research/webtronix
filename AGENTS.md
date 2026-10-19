@@ -6,10 +6,12 @@ Guidance for AI coding agents (and new contributors) working on `webtronix`.
 
 `webtronix` is a small Rust command-line tool. It takes a file of URLs,
 fetches them concurrently, extracts the text of each HTML page or PDF, and
-upserts the result into a SQLite index (`index.db` by default). Re-running it
-against an existing index sends conditional requests (`If-None-Match` /
-`If-Modified-Since`) so unchanged pages are not downloaded again, and prunes
-rows whose URL is no longer in the input list.
+upserts the result into a SQLite index (`index.db` by default). Pages that
+are only a JavaScript shell when served (Substack home pages, for example)
+are loaded in a headless Chrome and the rendered DOM is extracted instead.
+Re-running it against an existing index sends conditional requests
+(`If-None-Match` / `If-Modified-Since`) so unchanged pages are not downloaded
+again, and prunes rows whose URL is no longer in the input list.
 
 The whole program lives in `src/main.rs`. Read its crate-level doc comment
 first; it is the authoritative description of behaviour.
@@ -26,8 +28,9 @@ first; it is the authoritative description of behaviour.
 
 Key dependencies: `clap` (derive CLI), `reqwest` (rustls, gzip, brotli),
 `tokio` + `futures` (concurrency), `trafilatura` + `scraper` (HTML text),
-`pdf-extract` (PDF text), `rusqlite` (bundled SQLite), `eyre` (errors),
-`tracing` (logging), `indicatif` (progress bar).
+`pdf-extract` (PDF text), `chromiumoxide` (headless Chrome over the DevTools
+protocol, for JavaScript-rendered pages), `rusqlite` (bundled SQLite),
+`eyre` (errors), `tracing` (logging), `indicatif` (progress bar).
 
 ## Build, test, lint
 
@@ -51,9 +54,14 @@ Run the tool with:
 cargo run -- urls.txt                 # writes ./index.db
 cargo run -- urls.txt -o out.db -c 32 -t 60 -v
 cargo run -- urls.txt --raw-html      # store HTML verbatim, PDFs still extracted
+cargo run -- urls.txt --render never  # index HTML as served, no browser
+cargo run -- urls.txt --render always # render every HTML page in Chrome
 ```
 
-`RUST_LOG` overrides the log level chosen by `-v` / `-q`.
+`RUST_LOG` overrides the log level chosen by `-v` / `-q`. Rendering needs a
+Chrome or Chromium binary; `chromiumoxide` finds the usual ones and the
+`CHROME` environment variable points it elsewhere. Without one the tool
+warns once and indexes pages as served.
 
 ## Architecture in one paragraph
 
@@ -62,8 +70,11 @@ table and migrating old indexes that lack the `mime` column), loads the
 stored HTTP validators, then drives `fetch` over every URL with
 `buffer_unordered(concurrency)`. Each `fetch` refuses unsupported content
 types before reading the body, sniffs the body when the server is unhelpful,
-and runs `extract` on a blocking thread inside `catch_unwind` because the PDF
-parser can panic on malformed input. Fetched pages go through a bounded
+hands HTML that looks like a script shell (`needs_render`) to the shared
+`Renderer`, which lazily launches one headless Chrome and loads the page in a
+tab until the DOM settles, and runs `extract` on a blocking thread inside
+`catch_unwind` because the PDF parser can panic on malformed input. Fetched
+pages go through a bounded
 `mpsc` channel to a single `spawn_blocking` writer task that owns the SQLite
 connection, so a slow disk back-pressures fetches instead of buffering pages
 in memory. Logging is routed through the progress bar via `BarWriter` so log
@@ -110,7 +121,9 @@ a temp directory named after the process id, and a hand-built one-page PDF
 (`tiny_pdf`) for the PDF path. Follow that pattern:
 
 - A behaviour change gets a test next to the existing ones.
-- Never add a test that hits a real URL.
+- Never add a test that hits a real URL, and never launch a browser in a
+  test; `needs_render` is tested on inline HTML, the render path only by
+  hand.
 - Clean up any temp directory you create.
 - Test names describe the behaviour (`extract_html_drops_boilerplate`), not
   the function.
@@ -137,3 +150,14 @@ a temp directory named after the process id, and a hand-built one-page PDF
   stays cheap on large indexes. Keep it that way.
 - The `304 Not Modified` path returns `Ok(None)` and leaves the existing row
   untouched; so does any fetch error for a URL that already has a row.
+- Rendering never fails a URL: a missing browser is warned about once, a
+  failed or timed-out render is logged and the page is indexed as served.
+  The validators always come from the served response, never the render.
+- `needs_render` is a heuristic (a `<noscript>` notice asking for
+  JavaScript, or scripts plus fewer than `MIN_WORDS` of visible text). A
+  false positive only costs a render; tune it rather than special-casing
+  sites.
+- `<noscript>` is pruned before extraction because a scripted browser never
+  shows it and trafilatura's fallback would otherwise index its raw text.
+- `MAX_TABS` caps open tabs independently of `--concurrency`; each tab is a
+  Chrome renderer process.

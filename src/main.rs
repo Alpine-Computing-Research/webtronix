@@ -11,6 +11,12 @@
 //!
 //! [trafilatura]: https://crates.io/crates/trafilatura
 //!
+//! Pages that are only a script shell when served (single-page apps such as
+//! Substack, where the server sends an empty root element and JavaScript
+//! fills it in) are loaded in a headless Chrome so the text can be read from
+//! the rendered DOM instead. `--render` controls when that happens; by
+//! default only pages that look like such a shell are rendered.
+//!
 //! Bandwidth is kept down by deduplicating the input, accepting compressed
 //! responses, refusing unsupported bodies before they are read, and sending
 //! conditional requests (`If-None-Match` / `If-Modified-Since`) based on the
@@ -25,7 +31,8 @@ use std::{
     time::Duration,
 };
 
-use clap::Parser;
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use clap::{Parser, ValueEnum};
 use eyre::{Context, Result, bail, eyre};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -33,7 +40,7 @@ use pdf_extract::{Document, Object, PlainTextOutput, decode_text_string};
 use reqwest::{Client, StatusCode, header};
 use rusqlite::{Connection, params};
 use scraper::{Html, Selector};
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, Semaphore, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use trafilatura::Options;
@@ -51,17 +58,24 @@ struct Args {
     /// Maximum number of in-flight requests.
     #[arg(short, long, default_value_t = 16)]
     concurrency: usize,
-    /// Per-request timeout in seconds.
+    /// Per-request timeout in seconds. Also bounds each browser render.
     #[arg(short, long, default_value_t = 30)]
     timeout: u64,
+    /// When to load an HTML page in a headless browser so its JavaScript
+    /// runs before the text is extracted. `auto` renders only pages whose
+    /// served HTML looks like a script shell. Needs Chrome or Chromium; set
+    /// `CHROME` to the binary if it is not found on its own.
+    #[arg(long, value_enum, default_value_t = Render::Auto)]
+    render: Render,
     /// Log each request. `RUST_LOG` overrides the level.
     #[arg(short, long)]
     verbose: bool,
     /// Suppress the progress bar and all logging.
     #[arg(short, long, conflicts_with = "verbose")]
     quiet: bool,
-    /// Store each HTML page exactly as fetched instead of its extracted text.
-    /// PDFs are still converted to text.
+    /// Store each HTML page exactly as fetched (or as rendered, see
+    /// `--render`) instead of its extracted text. PDFs are still converted
+    /// to text.
     #[arg(long)]
     raw_html: bool,
 }
@@ -137,6 +151,179 @@ impl Kind {
     }
 }
 
+/// When HTML pages are rendered in a browser before their text is extracted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Render {
+    /// Only pages whose served HTML looks like a script shell.
+    Auto,
+    /// Every HTML page.
+    Always,
+    /// No page; HTML is indexed as served.
+    Never,
+}
+
+/// Tabs open at once. Each is a Chrome renderer process, far heavier than
+/// an in-flight request, so this is not tied to `--concurrency`.
+const MAX_TABS: usize = 4;
+
+/// How long the DOM must stay unchanged after `load` before it is read.
+const SETTLE: Duration = Duration::from_millis(250);
+
+/// Most settle intervals waited for one page; pages with animations or
+/// tickers never go quiet.
+const MAX_SETTLE_ROUNDS: u32 = 20;
+
+/// Fewest words of visible text a served page can have before it is taken
+/// for a script shell.
+const MIN_WORDS: usize = 200;
+
+/// A headless browser shared by every fetch. Launching Chrome costs a
+/// second or so and most runs never need it, so it starts on the first page
+/// that does. A failed launch is reported once and remembered, so later
+/// pages fall back to their served HTML without more noise.
+struct Renderer {
+    mode: Render,
+    /// Bound on one page load, including the wait for its scripts to settle.
+    timeout: Duration,
+    /// `None` once a launch has failed.
+    browser: OnceCell<Option<Browser>>,
+    tabs: Semaphore,
+}
+
+impl Renderer {
+    fn new(mode: Render, timeout: Duration) -> Self {
+        Self {
+            mode,
+            timeout,
+            browser: OnceCell::new(),
+            tabs: Semaphore::new(MAX_TABS),
+        }
+    }
+
+    /// The browser, launched on first use.
+    async fn browser(&self) -> Option<&Browser> {
+        self.browser
+            .get_or_init(|| async {
+                match launch_browser(self.timeout).await {
+                    Ok(browser) => Some(browser),
+                    Err(e) => {
+                        warn!("no browser, indexing pages as served: {e:#}");
+                        None
+                    }
+                }
+            })
+            .await
+            .as_ref()
+    }
+
+    /// Load `url` in a fresh tab, wait for its scripts to settle and return
+    /// the resulting DOM as HTML. `None` when no browser is available.
+    async fn render(&self, url: &str) -> Result<Option<String>> {
+        let Some(browser) = self.browser().await else {
+            return Ok(None);
+        };
+        let _slot = self.tabs.acquire().await?;
+        let tab = browser.new_page("about:blank").await?;
+        let html =
+            tokio::time::timeout(self.timeout, load_and_settle(&tab, url))
+                .await;
+        // Closed whatever happened, so a timed-out load does not keep its
+        // tab (and renderer process) alive for the rest of the run.
+        if let Err(e) = tab.close().await {
+            warn!(url, "closing tab: {e}");
+        }
+        let html =
+            html.map_err(|_| eyre!("timed out after {:?}", self.timeout))??;
+        Ok(Some(html))
+    }
+
+    /// Shut the browser down, if one was launched.
+    async fn close(self) {
+        if let Some(Some(mut browser)) = self.browser.into_inner() {
+            if let Err(e) = browser.close().await {
+                warn!("closing browser: {e}");
+            }
+            // Reaps the child; it is killed on drop anyway if close failed.
+            if let Err(e) = browser.wait().await {
+                warn!("waiting for browser exit: {e}");
+            }
+        }
+    }
+}
+
+/// Start a headless browser and spawn the task that drives its connection.
+async fn launch_browser(timeout: Duration) -> Result<Browser> {
+    let config = BrowserConfig::builder()
+        .request_timeout(timeout)
+        .build()
+        .map_err(|e| eyre!(e))?;
+    let (browser, mut handler) = Browser::launch(config).await?;
+    // The handler multiplexes every tab over one websocket and ends with
+    // the browser, so nothing needs to join it.
+    tokio::spawn(async move {
+        while let Some(event) = handler.next().await {
+            if event.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(browser)
+}
+
+/// Serialises the document once it has fully loaded, as `Page::content`
+/// does, and evaluates to `null` before then. Navigation resolves when the
+/// new document is committed, not loaded, so a shell whose deferred scripts
+/// are still downloading would otherwise look settled.
+const SETTLED_CONTENT: &str = "document.readyState === 'complete'
+    ? (document.doctype
+        ? new XMLSerializer().serializeToString(document.doctype)
+        : '') + document.documentElement.outerHTML
+    : null";
+
+/// Navigate a tab to `url`, then wait until the document has loaded and
+/// its DOM has stopped changing (for at most [`MAX_SETTLE_ROUNDS`]) so
+/// content that scripts fill in after `load`, such as a fetched post list,
+/// is included.
+async fn load_and_settle(
+    tab: &chromiumoxide::Page,
+    url: &str,
+) -> Result<String> {
+    tab.goto(url).await?;
+    let mut last: Option<String> = None;
+    for _ in 0..MAX_SETTLE_ROUNDS {
+        tokio::time::sleep(SETTLE).await;
+        let next: Option<String> =
+            tab.evaluate(SETTLED_CONTENT).await?.into_value()?;
+        if next.is_some() && next == last {
+            break;
+        }
+        last = next;
+    }
+    last.ok_or_else(|| eyre!("page never finished loading"))
+}
+
+/// Whether served HTML looks like a shell that a browser fills in with
+/// JavaScript: it carries a `<noscript>` notice asking for JavaScript, or it
+/// loads scripts yet shows fewer than [`MIN_WORDS`] words. A short static
+/// page trips this too; rendering it only costs time, as the text is the
+/// same either way.
+fn needs_render(html: &str) -> bool {
+    let doc = Html::parse_document(html);
+    let noscript = Selector::parse("noscript").expect("valid selector");
+    let asks_for_js = doc.select(&noscript).any(|n| {
+        n.text()
+            .collect::<String>()
+            .to_lowercase()
+            .contains("javascript")
+    });
+    if asks_for_js {
+        return true;
+    }
+    let script = Selector::parse("script").expect("valid selector");
+    doc.select(&script).next().is_some()
+        && visible_text_of(&doc).split_whitespace().count() < MIN_WORDS
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -155,11 +342,14 @@ async fn main() -> Result<()> {
         (_, true) => "off",
         _ => "error",
     };
+    // chromiumoxide warns about every protocol message newer than its
+    // generated types, which a current Chrome sends constantly; harmless.
+    let log_filter = format!("{log_level},chromiumoxide=error");
     let log_writer = bar.clone();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| log_level.into()),
+                .unwrap_or_else(|_| log_filter.into()),
         )
         .with_writer(move || BarWriter(log_writer.clone()))
         .init();
@@ -188,12 +378,15 @@ async fn main() -> Result<()> {
         .build()?;
 
     let raw_html = args.raw_html;
+    let renderer =
+        Renderer::new(args.render, Duration::from_secs(args.timeout));
     let mut results = stream::iter(urls.iter().cloned())
         .map(|url| {
             let client = &client;
+            let renderer = &renderer;
             let cached = previous.get(&url);
             async move {
-                match fetch(client, &url, cached, raw_html).await {
+                match fetch(client, renderer, &url, cached, raw_html).await {
                     Ok(page) => page,
                     Err(e) if cached.is_some() => {
                         warn!(url, "keeping previous entry: {e:#}");
@@ -233,6 +426,9 @@ async fn main() -> Result<()> {
     drop(tx);
     let (db, written) = writer.await??;
     let pruned = prune(&db, &urls)?;
+    // The exhausted stream still borrows the renderer until it is dropped.
+    drop(results);
+    renderer.close().await;
     bar.finish_and_clear();
     info!(written, pruned, path = %args.output.display(), "updated index");
     Ok(())
@@ -241,8 +437,13 @@ async fn main() -> Result<()> {
 /// Fetch and extract one page, sending a conditional request when validators
 /// are available. Returns `None` on `304 Not Modified`. With `raw_html` the
 /// text of an HTML page is the page itself.
+///
+/// The conditional request and the validators always concern the served
+/// HTML; a page the renderer rebuilds in a browser still counts as unchanged
+/// when the server says so.
 async fn fetch(
     client: &Client,
+    renderer: &Renderer,
     url: &str,
     cached: Option<&Validators>,
     raw_html: bool,
@@ -295,6 +496,10 @@ async fn fetch(
     };
     let kind = kind.unwrap_or_else(|| Kind::sniff(&body));
     let mime = declared.unwrap_or_else(|| kind.mime().to_owned());
+    let (body, rendered) = match kind {
+        Kind::Html => render_if_needed(renderer, url, body).await?,
+        Kind::Pdf => (body, false),
+    };
     let owned_url = url.to_owned();
     let (title, text) = tokio::task::spawn_blocking(move || {
         panic::catch_unwind(AssertUnwindSafe(|| {
@@ -305,7 +510,7 @@ async fn fetch(
         })
     })
     .await??;
-    info!(url, mime, bytes = text.len(), "indexed");
+    info!(url, mime, rendered, bytes = text.len(), "indexed");
     Ok(Some(Page {
         url: url.to_owned(),
         mime,
@@ -313,6 +518,39 @@ async fn fetch(
         text,
         validators,
     }))
+}
+
+/// Swap a served HTML body for its browser-rendered DOM when the renderer's
+/// mode calls for it, reporting whether that happened. A render that fails
+/// is logged and the page is indexed as served, since a shell with a title
+/// still beats no row at all.
+async fn render_if_needed(
+    renderer: &Renderer,
+    url: &str,
+    body: Vec<u8>,
+) -> Result<(Vec<u8>, bool)> {
+    let (wanted, body) = match renderer.mode {
+        Render::Always => (true, body),
+        Render::Never => (false, body),
+        Render::Auto => {
+            tokio::task::spawn_blocking(move || {
+                let wanted = needs_render(&String::from_utf8_lossy(&body));
+                (wanted, body)
+            })
+            .await?
+        }
+    };
+    if !wanted {
+        return Ok((body, false));
+    }
+    match renderer.render(url).await {
+        Ok(Some(html)) => Ok((html.into_bytes(), true)),
+        Ok(None) => Ok((body, false)),
+        Err(e) => {
+            warn!(url, "rendering failed, indexing as served: {e:#}");
+            Ok((body, false))
+        }
+    }
 }
 
 /// The message carried by a panic payload, if it is the usual string.
@@ -383,6 +621,10 @@ fn extract_html(html: &str, url: &str) -> (Option<String>, String) {
     let mut opts = Options::default().with_fallback(true);
     opts.original_url = url.parse().ok();
     opts.exclude_comments = true;
+    // A browser with scripts on never shows `<noscript>`, and its contents
+    // (typically a "turn on JavaScript" banner with inline CSS) are raw
+    // text that the fallback would otherwise recover as prose.
+    opts.prune_selector = Some("noscript".to_owned());
     match trafilatura::extract(html, &opts) {
         Ok(result) => {
             // The `<title>` element is preferred; trafilatura's metadata
@@ -413,7 +655,11 @@ fn html_title(html: &str) -> Option<String> {
 /// All visible text of an HTML document joined by single spaces, skipping
 /// script, style and other non-content elements.
 fn visible_text(html: &str) -> String {
-    let doc = Html::parse_document(html);
+    visible_text_of(&Html::parse_document(html))
+}
+
+/// [`visible_text`] of an already parsed document.
+fn visible_text_of(doc: &Html) -> String {
     doc.tree
         .nodes()
         .filter_map(|node| {
@@ -535,6 +781,53 @@ mod tests {
             <body><p>Hello,   <b>world</b></p><script>var x = 1;</script></body></html>"#;
         assert_eq!(html_title(html).as_deref(), Some("Hi"));
         assert_eq!(visible_text(html), "Hello, world");
+    }
+
+    #[test]
+    fn needs_render_spots_script_shells() {
+        let shell = r#"<html><head><title>App</title>
+            <script src="/static/app.js" defer></script></head>
+            <body><div id="root"></div></body></html>"#;
+        assert!(needs_render(shell));
+
+        let prose = "words of real content ".repeat(100);
+        let article = format!(
+            "<html><body><script>track()</script>\
+             <article><p>{prose}</p></article></body></html>"
+        );
+        assert!(!needs_render(&article));
+
+        let plain = "<html><body><p>Short, and no scripts.</p></body></html>";
+        assert!(!needs_render(plain));
+    }
+
+    #[test]
+    fn needs_render_heeds_noscript_notice() {
+        let prose = "words of real content ".repeat(100);
+        let html = format!(
+            "<html><body><noscript><p>Please enable JavaScript.</p>\
+             </noscript><nav>{prose}</nav></body></html>"
+        );
+        assert!(needs_render(&html));
+        let html = format!(
+            "<html><body><noscript><img src=\"/pixel.gif\"></noscript>\
+             <nav>{prose}</nav></body></html>"
+        );
+        assert!(!needs_render(&html));
+    }
+
+    #[test]
+    fn extract_html_ignores_noscript() {
+        let body = "This is the main article content. ".repeat(10);
+        let html = format!(
+            "<html><body><noscript><style>#b{{color:red}}</style>\
+             <div id=\"b\">Please turn on JavaScript</div></noscript>\
+             <article><p>{body}</p></article></body></html>"
+        );
+        let (_, text) = extract_html(&html, URL);
+        assert!(text.contains("main article content"));
+        assert!(!text.contains("JavaScript"), "noscript kept: {text}");
+        assert!(!text.contains("color"), "noscript css kept: {text}");
     }
 
     #[test]
