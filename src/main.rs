@@ -173,6 +173,12 @@ const SETTLE: Duration = Duration::from_millis(250);
 /// tickers never go quiet.
 const MAX_SETTLE_ROUNDS: u32 = 20;
 
+/// Consecutive unchanged settle intervals before the DOM counts as settled.
+/// One is not enough: a page sits still for a quarter second with its
+/// sign-up modal painted while the request for its real content is in
+/// flight, more so when the crawl itself is loading the network.
+const QUIET_ROUNDS: u32 = 3;
+
 /// Fewest words of visible text a served page can have before it is taken
 /// for a script shell.
 const MIN_WORDS: usize = 200;
@@ -283,23 +289,42 @@ const SETTLED_CONTENT: &str = "document.readyState === 'complete'
 /// Navigate a tab to `url`, then wait until the document has loaded and
 /// its DOM has stopped changing (for at most [`MAX_SETTLE_ROUNDS`]) so
 /// content that scripts fill in after `load`, such as a fetched post list,
-/// is included.
+/// is included. See [`settled`] for what counts as stopped.
 async fn load_and_settle(
     tab: &chromiumoxide::Page,
     url: &str,
 ) -> Result<String> {
     tab.goto(url).await?;
     let mut last: Option<String> = None;
+    let mut quiet = 0;
     for _ in 0..MAX_SETTLE_ROUNDS {
         tokio::time::sleep(SETTLE).await;
         let next: Option<String> =
             tab.evaluate(SETTLED_CONTENT).await?.into_value()?;
-        if next.is_some() && next == last {
-            break;
+        quiet = if next.is_some() && next == last {
+            quiet + 1
+        } else {
+            0
+        };
+        if let Some(html) = &next
+            && settled(quiet, html)
+        {
+            return Ok(next.expect("checked above"));
         }
         last = next;
     }
     last.ok_or_else(|| eyre!("page never finished loading"))
+}
+
+/// Whether a rendered document that has been unchanged for `quiet`
+/// consecutive intervals is done loading. It must have been quiet for
+/// [`QUIET_ROUNDS`], and while it still reads like a shell (fewer than
+/// [`MIN_WORDS`] words, the same test that sent it to the browser) it is
+/// given the rest of the settle budget, since a page that stays that empty
+/// is most likely still waiting on a request for its content.
+fn settled(quiet: u32, html: &str) -> bool {
+    quiet >= QUIET_ROUNDS
+        && visible_text(html).split_whitespace().count() >= MIN_WORDS
 }
 
 /// Whether served HTML looks like a shell that a browser fills in with
@@ -781,6 +806,20 @@ mod tests {
             <body><p>Hello,   <b>world</b></p><script>var x = 1;</script></body></html>"#;
         assert_eq!(html_title(html).as_deref(), Some("Hi"));
         assert_eq!(visible_text(html), "Hello, world");
+    }
+
+    #[test]
+    fn settled_waits_for_quiet_and_for_content() {
+        let shell = "<html><body><div>Subscribe</div></body></html>";
+        let words = ["word"; MIN_WORDS].join(" ");
+        let full = format!("<html><body><p>{words}</p></body></html>");
+        assert!(
+            !settled(QUIET_ROUNDS - 1, &full),
+            "one quiet round is not enough"
+        );
+        assert!(settled(QUIET_ROUNDS, &full));
+        assert!(!settled(QUIET_ROUNDS, shell), "a quiet shell keeps waiting");
+        assert!(!settled(MAX_SETTLE_ROUNDS, shell));
     }
 
     #[test]
