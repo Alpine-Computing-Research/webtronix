@@ -23,6 +23,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, StatusCode, header};
 use rusqlite::{Connection, params};
 use scraper::{Html, Selector};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
         .with_writer(move || BarWriter(log_writer.clone()))
         .init();
 
-    let mut db = open_index(&args.output)?;
+    let db = open_index(&args.output)?;
     let previous = load_validators(&db)?;
     let client = Client::builder()
         .user_agent(concat!(
@@ -139,18 +140,30 @@ async fn main() -> Result<()> {
         })
         .buffer_unordered(args.concurrency);
 
-    // Each page is written as soon as it lands; unchanged and failed pages
-    // leave their existing row alone.
-    let mut written = 0;
+    // Pages are written by a dedicated blocking task so a slow write never
+    // stalls the in-flight fetches. Unchanged and failed pages leave their
+    // existing row alone. The channel is bounded so a slow disk applies
+    // back-pressure instead of buffering every page in memory.
+    let (tx, mut rx) = mpsc::channel::<Page>(args.concurrency);
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut written = 0;
+        while let Some(page) = rx.blocking_recv() {
+            upsert(&db, &page)?;
+            written += 1;
+        }
+        Ok::<_, eyre::Report>((db, written))
+    });
     while let Some(page) = results.next().await {
         bar.inc(1);
         let Some(page) = page else { continue };
-        db = tokio::task::spawn_blocking(move || {
-            upsert(&db, &page).map(|()| db)
-        })
-        .await??;
-        written += 1;
+        if tx.send(page).await.is_err() {
+            // The writer only stops early if a write failed; its error is
+            // reported below once the fetches are wound down.
+            break;
+        }
     }
+    drop(tx);
+    let (db, written) = writer.await??;
     let pruned = prune(&db, &urls)?;
     bar.finish_and_clear();
     info!(written, pruned, path = %args.output.display(), "updated index");
