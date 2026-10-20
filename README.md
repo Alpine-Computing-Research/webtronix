@@ -40,3 +40,21 @@ The default (`--format text --render auto`) extracts text and renders only
 pages whose served HTML looks like a JavaScript shell. `--format html
 --render auto` likewise stores the served HTML except for such shells, which
 get the rendered DOM. PDFs are converted to text in every combination.
+
+## Functionality ##
+
+Webtronix can handle:
+
+ - Plain HTML
+ - HTML requiring hydration via Javascript interpretation
+ - PDFs
+
+### To-Do ###
+
+ - Wayback Machine fallback for dead links
+ - Moderation (e.g., dead link becomes camsite hijack[^1])
+ - CAPTCHA defeat
+
+
+[^1]: Yes this happened in the corpus.
+
