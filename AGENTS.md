@@ -4,9 +4,13 @@ Guidance for AI coding agents (and new contributors) working on `webtronix`.
 
 ## What this is
 
-`webtronix` is a small Rust command-line tool. It takes a file of URLs,
-fetches them concurrently, extracts the text of each HTML page or PDF, and
-upserts the result into a SQLite index (`index.db` by default). Pages that
+`webtronix` is a small Rust library with a command-line front end. It takes
+a list of URLs, fetches them concurrently, extracts the text of each HTML
+page or PDF, and upserts the result into a SQLite index (`index.db` by
+default). Other programs call in through `webtronix::Index` (`open`,
+`update`, `get`, `pages`) with a `webtronix::Options`; the binary is a thin
+wrapper that only adds argument and config-file parsing, logging and a
+progress bar. Pages that
 are only a JavaScript shell when served (Substack home pages, for example)
 are loaded in a headless Chrome and the rendered DOM is extracted instead.
 Re-running it against an existing index sends conditional requests
@@ -18,25 +22,29 @@ Every option can be set on the command line or in a TOML config file
 wins over the file, the file over the default. Environment variables are
 never read for configuration.
 
-The whole program lives in `src/main.rs`. Read its crate-level doc comment
-first; it is the authoritative description of behaviour.
+The library lives in `src/lib.rs` and the command line in `src/main.rs`.
+Read the library's crate-level doc comment first; it is the authoritative
+description of behaviour.
 
 ## Layout
 
 | Path                         | Purpose                                                  |
 | ---------------------------- | -------------------------------------------------------- |
-| `src/main.rs`                | Entire program: CLI args, fetch, extract, SQLite, tests  |
-| `Cargo.toml`                 | Rust 2024 edition; dependencies listed below             |
+| `src/lib.rs`                 | The library: `Index`, `Options`, fetch, extract, SQLite  |
+| `src/main.rs`                | The binary: CLI args, config file, logging, progress bar |
+| `Cargo.toml`                 | Rust 2024 edition; `cli` feature gates the binary's deps |
 | `rustfmt.toml`               | `max_width = 80`                                         |
 | `.github/workflows/main.yml` | CI (build, test, doc, lint, bench, audit)                |
 | `*.tmp`, `*.db*`             | Local scratch and indexes; git-ignored, never commit     |
 
-Key dependencies: `clap` (derive CLI), `reqwest` (rustls, gzip, brotli),
-`tokio` + `futures` (concurrency), `trafilatura` + `scraper` (HTML text),
+Key dependencies of the library: `reqwest` (rustls, gzip, brotli), `tokio` +
+`futures` (concurrency), `trafilatura` + `scraper` (HTML text),
 `pdf-extract` (PDF text), `chromiumoxide` (headless Chrome over the DevTools
 protocol, for JavaScript-rendered pages), `rusqlite` (bundled SQLite),
-`serde` + `toml` (config file), `eyre` (errors), `tracing` (logging),
-`indicatif` (progress bar).
+`serde` (the `Format` and `Render` enums deserialize), `eyre` (errors),
+`tracing` (logging). Only the binary needs `clap` (derive CLI), `toml`
+(config file), `tracing-subscriber` and `indicatif` (progress bar); they are
+optional, pulled in by the default `cli` feature.
 
 ## Build, test, lint
 
@@ -45,13 +53,14 @@ Everything CI runs, in the order you should run it before finishing a change:
 ```sh
 cargo fmt -- --check                      # rustfmt, 80 columns
 cargo clippy --all-targets -- -D warnings # warnings are errors
+cargo clippy --no-default-features --all-targets -- -D warnings # library alone
 cargo test
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 ```
 
 CI also runs `cargo build`, `cargo check`, `cargo bench` (there are currently
-no benches) and `cargo audit`. A change is not done until fmt, clippy, test
-and doc all pass locally. Do not loosen lints or add `#[allow]` to get there;
+no benches) and `cargo audit`. A change is not done until fmt, both clippy
+runs, test and doc all pass locally. Do not loosen lints or add `#[allow]` to get there;
 fix the code instead.
 
 Run the tool with:
@@ -74,28 +83,39 @@ once and indexes pages as served.
 
 ## Architecture in one paragraph
 
-`main` parses the command line, reads the config file and resolves the two
-into `Settings` (command line, then file, then default), reads and dedupes
-the URL list, opens the index (creating the `pages`
-table and migrating old indexes that lack the `mime` column), loads the
-stored HTTP validators, then drives `fetch` over every URL with
-`buffer_unordered(concurrency)`. Each `fetch` refuses unsupported content
+`main` (binary) parses the command line, reads the config file and resolves
+the two into `Settings` (command line, then file, then `Options::default`),
+reads and dedupes the URL list, sets up logging and the progress bar, opens
+the `Index` and calls `Index::update`. `Index::open` (library) creates the
+`pages` table and migrates old indexes that lack the `mime` column.
+`Index::update` loads the stored HTTP validators, then drives `fetch` over
+every URL with `buffer_unordered(concurrency)`. Each `fetch` refuses unsupported content
 types before reading the body, sniffs the body when the server is unhelpful,
 hands HTML that looks like a script shell (`needs_render`) to the shared
 `Renderer`, which lazily launches one headless Chrome and loads the page in a
 tab until the DOM settles, and runs `extract` on a blocking thread inside
 `catch_unwind` because the PDF parser can panic on malformed input. Fetched
-pages go through a bounded
-`mpsc` channel to a single `spawn_blocking` writer task that owns the SQLite
-connection, so a slow disk back-pressures fetches instead of buffering pages
-in memory. Logging is routed through the progress bar via `BarWriter` so log
-lines do not tear it. After all fetches finish, `prune` drops rows for URLs
-not in the input.
+pages go through a bounded `mpsc` channel to a single `spawn_blocking` writer
+task, so a slow disk back-pressures fetches instead of buffering pages in
+memory. The SQLite connection sits behind a `Mutex` in the `Index` so the
+writer and the caller's reads can share it; each statement takes the lock
+for its own duration only. After all fetches finish, `prune` drops rows for
+URLs not in the input. In the binary, logging is routed through the progress
+bar via `BarWriter` so log lines do not tear it, and the library's
+`on_done` callback advances the bar.
 
 ## Conventions
 
-- **Single file.** Keep everything in `src/main.rs` unless a change genuinely
-  needs a second module. Do not split it up as a matter of taste.
+- **Two files.** Everything that does the work is in `src/lib.rs`; only
+  what is specific to running from a terminal (arguments, config file,
+  logging set-up, progress bar) is in `src/main.rs`. Do not add modules as
+  a matter of taste, and do not make the binary depend on anything the
+  library does not expose publicly.
+- **Public API.** The library's surface is `Index`, `Options`, `Summary`,
+  `Page`, `Validators`, `Format`, `Render`, `Kind`, `extract` and
+  `read_urls`. Keep it that small; new knobs go on `Options` (with a
+  default) rather than as new entry points. The library never reads
+  environment variables, installs a logger or a panic hook, or prints.
 - **Doc comments on everything.** Every item, including private functions,
   structs and enum variants, has a `///` comment saying what it does and any
   non-obvious contract. `cargo doc` runs with `-D warnings`, so broken
@@ -121,26 +141,29 @@ not in the input.
 - **Formatting.** `cargo fmt` with the 80-column limit in `rustfmt.toml`.
   Imports are grouped `std`, then external crates, as the file does now.
 - **Configuration.** Options come from the command line, then the config
-  file, then a built-in default, resolved in `Settings::resolve`. Never read
-  environment variables for configuration. A new option is added in three
-  places: `Args` (as an `Option`, with its default stated in the help text),
-  `Config` (same key name as the long flag) and `Settings`, plus a line in
-  the README's example config.
+  file, then `Options::default()`, resolved in `Settings::resolve`. Never
+  read environment variables for configuration. A new option is added in
+  four places: `Options` in the library (with its default), `Args` (as an
+  `Option`, with the default stated in the help text), `Config` (same key
+  name as the long flag) and `Settings::resolve`, plus a line in the
+  README's example config.
 - **No new dependencies without reason.** Prefer what is already in
   `Cargo.toml`. If one is needed, keep features minimal (see how `reqwest`
   and `tokio` are declared) and keep `rustls`; do not pull in OpenSSL.
 
 ## Tests
 
-Unit tests live in `mod tests` at the bottom of `src/main.rs` and run with
-`cargo test`. They are hermetic: no network access, SQLite via `:memory:` or
+Unit tests live in `mod tests` at the bottom of each file (the pipeline's in
+`src/lib.rs`, the config and argument handling's in `src/main.rs`) and run
+with `cargo test`, as does the example in the library's crate doc. They are hermetic: no network access, SQLite via `:memory:` or
 a temp directory named after the process id, and a hand-built one-page PDF
 (`tiny_pdf`) for the PDF path. Follow that pattern:
 
 - A behaviour change gets a test next to the existing ones.
 - Never add a test that hits a real URL, and never launch a browser in a
   test; `needs_render` is tested on inline HTML, the render path only by
-  hand.
+  hand. `Index::update` is exercised with an empty URL list, which builds
+  the client and prunes without a single request.
 - Clean up any temp directory you create.
 - Test names describe the behaviour (`extract_html_drops_boilerplate`), not
   the function.

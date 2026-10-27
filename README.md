@@ -64,6 +64,35 @@ pages whose served HTML looks like a JavaScript shell. `--format html
 --render auto` likewise stores the served HTML except for such shells, which
 get the rendered DOM. PDFs are converted to text in every combination.
 
+## Library ##
+
+The binary is a thin front end over the `webtronix` library, which other
+programs can use directly. `Index::open` opens or creates an index,
+`Index::update` brings it in line with a URL list, and `Index::get` and
+`Index::pages` read the result back. Every command-line option is a field
+of `Options`.
+
+```rust
+use webtronix::{Index, Options};
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    let index = Index::open("index.db".as_ref())?;
+    let urls = vec!["https://example.com/".to_owned()];
+    let summary = index.update(&urls, &Options::default(), |_url| {}).await?;
+    println!("{} written, {} pruned", summary.written, summary.pruned);
+    if let Some(page) = index.get("https://example.com/")? {
+        println!("{}", page.text);
+    }
+    Ok(())
+}
+```
+
+Depend on it with `default-features = false` to leave out the binary's own
+dependencies (`clap`, `toml`, `indicatif`, `tracing-subscriber`). The
+library reports progress and failures through `tracing` and reads no
+environment variables.
+
 ## Functionality ##
 
 Webtronix can handle:
