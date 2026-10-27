@@ -13,6 +13,11 @@ Re-running it against an existing index sends conditional requests
 (`If-None-Match` / `If-Modified-Since`) so unchanged pages are not downloaded
 again, and prunes rows whose URL is no longer in the input list.
 
+Every option can be set on the command line or in a TOML config file
+(`--config`, or `webtronix.toml` in the working directory); the command line
+wins over the file, the file over the default. Environment variables are
+never read for configuration.
+
 The whole program lives in `src/main.rs`. Read its crate-level doc comment
 first; it is the authoritative description of behaviour.
 
@@ -30,7 +35,8 @@ Key dependencies: `clap` (derive CLI), `reqwest` (rustls, gzip, brotli),
 `tokio` + `futures` (concurrency), `trafilatura` + `scraper` (HTML text),
 `pdf-extract` (PDF text), `chromiumoxide` (headless Chrome over the DevTools
 protocol, for JavaScript-rendered pages), `rusqlite` (bundled SQLite),
-`eyre` (errors), `tracing` (logging), `indicatif` (progress bar).
+`serde` + `toml` (config file), `eyre` (errors), `tracing` (logging),
+`indicatif` (progress bar).
 
 ## Build, test, lint
 
@@ -57,16 +63,20 @@ cargo run -- urls.txt --format html   # store HTML verbatim, PDFs still extracte
 cargo run -- urls.txt --render never  # no browser: HTML as served
 cargo run -- urls.txt --render always # run every HTML page's JavaScript in Chrome
 cargo run -- urls.txt --format html --render always  # rendered DOM, no extraction
+cargo run -- urls.txt --config prod.toml             # defaults from a file
 ```
 
-`RUST_LOG` overrides the log level chosen by `-v` / `-q`. Rendering needs a
-Chrome or Chromium binary; `chromiumoxide` finds the usual ones and the
-`CHROME` environment variable points it elsewhere. Without one the tool
-warns once and indexes pages as served.
+`--log` (or `log` in the config file) takes `tracing` filter directives and
+replaces the level chosen by `-v` / `-q`. Rendering needs a Chrome or
+Chromium binary; `chromiumoxide` finds the usual ones and `--chrome` (or
+`chrome` in the config file) points it elsewhere. Without one the tool warns
+once and indexes pages as served.
 
 ## Architecture in one paragraph
 
-`main` reads and dedupes the URL list, opens the index (creating the `pages`
+`main` parses the command line, reads the config file and resolves the two
+into `Settings` (command line, then file, then default), reads and dedupes
+the URL list, opens the index (creating the `pages`
 table and migrating old indexes that lack the `mime` column), loads the
 stored HTTP validators, then drives `fetch` over every URL with
 `buffer_unordered(concurrency)`. Each `fetch` refuses unsupported content
@@ -110,6 +120,12 @@ not in the input.
   its test) because users re-run the tool against old databases.
 - **Formatting.** `cargo fmt` with the 80-column limit in `rustfmt.toml`.
   Imports are grouped `std`, then external crates, as the file does now.
+- **Configuration.** Options come from the command line, then the config
+  file, then a built-in default, resolved in `Settings::resolve`. Never read
+  environment variables for configuration. A new option is added in three
+  places: `Args` (as an `Option`, with its default stated in the help text),
+  `Config` (same key name as the long flag) and `Settings`, plus a line in
+  the README's example config.
 - **No new dependencies without reason.** Prefer what is already in
   `Cargo.toml`. If one is needed, keep features minimal (see how `reqwest`
   and `tokio` are declared) and keep `rustls`; do not pull in OpenSSL.
